@@ -1,0 +1,27 @@
+# claude
+.claude/
+
+# macOS
+.DS_Store
+
+# Local env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Runtime data
+data.db
+data.db-shm
+data.db-wal
+downloads/
+log/
+
+# Node / pot-provider build artifacts
+pot-provider/node_modules/
+pot-provider/build/
+pot-provider/tsconfig.tsbuildinfo

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YouTube 视频下载器</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+    theme: {
+        extend: {
+            colors: { dark: { 900: '#0d1117', 800: '#161b22', 700: '#1c2333', 600: '#30363d' } }
+        }
+    }
+}
+</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-dark-900 text-gray-200 min-h-screen">
+
+<!-- Toast Container -->
+<div id="toast-container" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+<div class="max-w-3xl mx-auto px-4 py-6">
+
+    <!-- Header -->
+    <div class="text-center mb-6">
+        <h1 class="text-2xl font-bold text-white flex items-center justify-center gap-2">
+            <span class="text-3xl">🎬</span> YouTube 视频下载器
+        </h1>
+        <p class="text-gray-500 text-sm mt-1">粘贴链接，选择清晰度，一键下载</p>
+    </div>
+
+    <!-- Tabs -->
+    <div class="flex border-b border-dark-600 mb-6">
+        <button class="tab-btn active px-5 py-2.5 text-sm font-medium text-gray-400 hover:text-white transition" data-tab="download">
+            📥 下载
+        </button>
+        <button class="tab-btn px-5 py-2.5 text-sm font-medium text-gray-400 hover:text-white transition" data-tab="history">
+            📋 历史
+        </button>
+        <button class="tab-btn px-5 py-2.5 text-sm font-medium text-gray-400 hover:text-white transition" data-tab="settings">
+            ⚙️ 设置
+        </button>
+    </div>
+
+    <!-- ═══════ Download Tab ═══════ -->
+    <div id="tab-download" class="tab-content active">
+
+        <!-- URL Input -->
+        <div class="flex gap-2 mb-6">
+            <input id="url-input" type="text"
+                   placeholder="粘贴 YouTube 视频链接..."
+                   class="flex-1 bg-dark-800 border border-dark-600 rounded-lg px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 transition">
+            <button id="parse-btn" onclick="parseVideo()"
+                    class="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium transition whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">
+                解析
+            </button>
+        </div>
+
+        <!-- Video Info (hidden by default) -->
+        <div id="video-info" class="hidden mb-6">
+            <div class="bg-dark-800 border border-dark-600 rounded-xl overflow-hidden">
+                <div class="flex flex-col sm:flex-row">
+                    <div class="sm:w-64 flex-shrink-0">
+                        <img id="video-thumbnail" src="" alt="" class="w-full h-36 sm:h-full object-cover">
+                    </div>
+                    <div class="p-4 flex flex-col justify-center min-w-0">
+                        <h3 id="video-title" class="text-white font-semibold text-base mb-2 line-clamp-2"></h3>
+                        <div class="space-y-1 text-sm text-gray-400">
+                            <p>👤 <span id="video-uploader"></span></p>
+                            <p>⏱ <span id="video-duration"></span></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Format Selection (hidden by default) -->
+        <div id="format-section" class="hidden mb-6">
+            <h3 class="text-sm font-medium text-gray-400 mb-3">选择清晰度</h3>
+            <div id="format-grid" class="grid grid-cols-2 sm:grid-cols-3 gap-2"></div>
+        </div>
+
+        <!-- Download Button -->
+        <div id="download-btn-section" class="hidden mb-8">
+            <button id="download-btn" onclick="startDownload()"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white py-3 rounded-lg font-medium transition disabled:opacity-50 disabled:cursor-not-allowed">
+                开始下载
+            </button>
+        </div>
+
+        <!-- Download Queue -->
+        <div id="queue-section">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-sm font-medium text-gray-400">下载队列</h3>
+                <div class="flex items-center gap-3">
+                    <span id="queue-count" class="text-xs text-gray-500"></span>
+                    <button id="clear-queue-btn" onclick="clearAllQueue()"
+                            class="text-xs text-gray-500 hover:text-red-400 transition">
+                        🗑 清空队列
+                    </button>
+                </div>
+            </div>
+            <div id="queue-list" class="space-y-2">
+                <p id="queue-empty" class="text-center text-gray-600 text-sm py-8">暂无下载任务</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- ═══════ History Tab ═══════ -->
+    <div id="tab-history" class="tab-content">
+        <div class="flex gap-2 mb-4">
+            <input id="history-search" type="text" placeholder="搜索标题..."
+                   class="flex-1 bg-dark-800 border border-dark-600 rounded-lg px-4 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"
+                   oninput="loadHistory()">
+        </div>
+        <div id="history-list" class="space-y-2">
+            <p id="history-empty" class="text-center text-gray-600 text-sm py-8">暂无下载记录</p>
+        </div>
+        <div id="history-pagination" class="flex justify-center gap-2 mt-4"></div>
+    </div>
+
+    <!-- ═══════ Settings Tab ═══════ -->
+    <div id="tab-settings" class="tab-content">
+        <div class="bg-dark-800 border border-dark-600 rounded-xl p-5 space-y-5">
+
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">YouTube Cookie</label>
+                <p class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2">从 Chrome 浏览器导入</p>
+                <div class="mt-2 px-3 py-2 rounded-lg bg-yellow-500/10 border border-yellow-500/40 text-yellow-300 text-sm font-medium flex items-start gap-2">
+                    <span>⚠️</span>
+                    <span>本项目只支持 Chrome 浏览器，并确保 Chrome 已登录 YouTube</span>
+                </div>
+            </div>
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">下载目录</label>
+                <p class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2 font-mono">项目目录下 downloads 文件夹</p>
+            </div>
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">最大并行下载数</label>
+                <p class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2">1</p>
+            </div>
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">yt-dlp</label>
+                <p id="health-ytdlp" class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2 font-mono">检测中...</p>
+            </div>
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">Node.js</label>
+                <p id="health-node" class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2 font-mono">检测中...</p>
+            </div>
+            <div>
+                <label class="text-sm text-gray-400 block mb-1">PO Token Provider 服务</label>
+                <p id="health-pot" class="text-sm text-gray-300 bg-dark-700 rounded-lg px-3 py-2 font-mono">检测中...</p>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
