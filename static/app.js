@@ -21,6 +21,9 @@ const PHASE_TEXT_FALLBACK = {
     formats: '准备下载格式',
     starting: '开始下载',
     retry: '重试中…',
+    pot_refresh: '刷新 PO Token',
+    downloading_video: '下载视频流',
+    downloading_audio: '下载音频流',
     merging: '合并音视频'
 };
 
@@ -192,6 +195,8 @@ function addQueueItem(taskId, title, formatNote, filesize) {
                 <button class="queue-reveal hidden text-xs text-gray-400 hover:text-blue-400 transition" title="打开所在目录" onclick="revealFile('${taskId}')">📂 打开位置</button>
                 <span class="queue-status text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400">等待中</span>
                 <button class="queue-cancel text-xs text-gray-500 hover:text-red-400 transition" onclick="cancelTask('${taskId}')">取消</button>
+                <button class="queue-resume hidden text-xs text-blue-400 hover:text-blue-300 transition" onclick="resumeTask('${taskId}')">继续下载</button>
+                <button class="queue-delete hidden text-xs text-gray-500 hover:text-red-400 transition" onclick="deleteQueueTask('${taskId}')">删除</button>
             </div>
         </div>
         <div class="w-full bg-dark-700 rounded-full h-2 mb-1.5 overflow-hidden">
@@ -323,11 +328,19 @@ function updateQueueItem(taskId, data) {
             clearElapsedTimer(taskId);
             progressEl.classList.add('failed');
             cancelEl.classList.add('hidden');
+            const deleteEl = item.querySelector('.queue-delete');
+            const resumeEl = item.querySelector('.queue-resume');
+            if (deleteEl) deleteEl.classList.remove('hidden');
+            if (resumeEl) resumeEl.classList.remove('hidden');
             if (data.error) detailEl.textContent = data.error;
         } else if (data.status === 'cancelled') {
             progressEl.classList.remove('indeterminate');
             clearElapsedTimer(taskId);
             cancelEl.classList.add('hidden');
+            const deleteEl = item.querySelector('.queue-delete');
+            const resumeEl = item.querySelector('.queue-resume');
+            if (deleteEl) deleteEl.classList.remove('hidden');
+            if (resumeEl) resumeEl.classList.remove('hidden');
         }
     }
 }
@@ -381,6 +394,30 @@ async function clearAllQueue() {
     }
 }
 
+// ── Delete a single queue task ──
+async function deleteQueueTask(taskId) {
+    if (!confirm('确定删除此任务？')) return;
+    try {
+        const res = await fetch('/api/download/' + taskId, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.code !== 0) throw new Error(data.message);
+        if (sseConnections[taskId]) {
+            sseConnections[taskId].close();
+            delete sseConnections[taskId];
+        }
+        const item = document.getElementById('queue-' + taskId);
+        if (item) item.remove();
+        updateQueueCount();
+        const list = document.getElementById('queue-list');
+        if (list.querySelectorAll('[id^="queue-"]').length === 0) {
+            document.getElementById('queue-empty').style.display = '';
+        }
+        showToast('已删除', 'success');
+    } catch (e) {
+        showToast(e.message || '删除失败', 'error');
+    }
+}
+
 // ── Reveal file in OS file manager ──
 async function revealFile(taskId) {
     try {
@@ -399,6 +436,47 @@ async function cancelTask(taskId) {
         updateQueueItem(taskId, { status: 'cancelled', progress: 0 });
     } catch (e) {
         showToast('取消失败', 'error');
+    }
+}
+
+// ── Resume (for cancelled / failed tasks) ──
+async function resumeTask(taskId) {
+    try {
+        const data = await api('/api/download/' + taskId + '/resume', {}, 'POST');
+        if (data.code !== 0) { showToast(data.message || '继续下载失败', 'error'); return; }
+
+        // Reset per-task UI state so the card looks like a fresh pending task.
+        const item = document.getElementById('queue-' + taskId);
+        if (item) {
+            const resumeEl = item.querySelector('.queue-resume');
+            const deleteEl = item.querySelector('.queue-delete');
+            const cancelEl = item.querySelector('.queue-cancel');
+            const progressEl = item.querySelector('.queue-progress');
+            const detailEl = item.querySelector('.queue-detail');
+            if (resumeEl) resumeEl.classList.add('hidden');
+            if (deleteEl) deleteEl.classList.add('hidden');
+            if (cancelEl) cancelEl.classList.remove('hidden');
+            if (progressEl) progressEl.classList.remove('failed');
+            if (detailEl) detailEl.textContent = '已等待 0s';
+        }
+        taskQueuedAt[taskId] = Date.now();
+        taskHasProgress[taskId] = false;
+        taskStartTimes[taskId] = null;
+        taskPhaseText[taskId] = '排队中';
+        clearElapsedTimer(taskId);
+        taskElapsedTimers[taskId] = setInterval(() => {
+            if (taskHasProgress[taskId]) { clearElapsedTimer(taskId); return; }
+            const el = document.querySelector('#queue-' + taskId + ' .queue-detail');
+            if (!el) { clearElapsedTimer(taskId); return; }
+            const secs = Math.round((Date.now() - (taskQueuedAt[taskId] || Date.now())) / 1000);
+            el.textContent = '已等待 ' + secs + 's';
+        }, 1000);
+
+        updateQueueItem(taskId, { status: 'pending', progress: 0, phase: 'queued', phase_text: '排队中' });
+        connectSSE(taskId);
+        showToast('已继续', 'success');
+    } catch (e) {
+        showToast('继续下载失败', 'error');
     }
 }
 
@@ -483,6 +561,9 @@ async function loadHealth() {
         document.getElementById('health-ytdlp').textContent = fmt(data.data.ytdlp);
         document.getElementById('health-node').textContent = fmt(data.data.node);
         document.getElementById('health-pot').textContent = fmt(data.data.pot_provider);
+        if (data.data.ffmpeg) {
+            document.getElementById('health-ffmpeg').textContent = fmt(data.data.ffmpeg);
+        }
     } catch (e) {}
 }
 loadHealth();

@@ -233,6 +233,39 @@ def cancel_download(task_id):
     return jsonify({'code': 1, 'message': '任务不存在或无法取消'})
 
 
+@app.route('/api/download/<task_id>/resume', methods=['POST'])
+def resume_download(task_id):
+    """Restart a cancelled/failed download on the same task_id. yt-dlp's
+    default --continue behavior picks up the existing .part file, so no
+    re-download from scratch — matches user expectation: cancelling a long
+    download then continuing later is seamless."""
+    task = get_task(task_id)
+    if not task:
+        return jsonify({'code': 1, 'message': '任务不存在'})
+    if task['status'] not in ('cancelled', 'failed'):
+        return jsonify({'code': 1, 'message': f'任务状态为 {task["status"]}，无法继续'})
+
+    url = task.get('url')
+    format_id = task.get('format_id')
+    if not url or not format_id:
+        return jsonify({'code': 1, 'message': '任务缺少 URL 或格式信息'})
+
+    with active_lock:
+        if task_id in active_tasks:
+            return jsonify({'code': 1, 'message': '任务已在运行'})
+        active_tasks[task_id] = {
+            'cancel_event': threading.Event(),
+            'sse_queues': []
+        }
+
+    # Clear any prior error and re-enter the pipeline from pending.
+    update_task(task_id, status='pending', progress=0, error=None)
+    _notify(task_id, {'phase': 'queued', 'phase_text': '排队中'})
+    executor.submit(_download_worker, task_id, url, format_id)
+    log.info(f"[{task_id}] resume submitted | url={url} | format={format_id}")
+    return jsonify({'code': 0, 'message': '已继续', 'data': {'id': task_id}})
+
+
 @app.route('/api/download/<task_id>', methods=['DELETE'])
 def remove_download(task_id):
     task = get_task(task_id)
@@ -336,7 +369,7 @@ def get_settings():
 def health_check():
     """Return status of yt-dlp, node.js, and the POT provider server."""
     import subprocess as sp
-    from config import YT_DLP_PATH, ARIA2C_PATH
+    from config import YT_DLP_PATH, ARIA2C_PATH, FFMPEG_PATH
 
     def _run(cmd):
         try:
@@ -348,6 +381,7 @@ def health_check():
     ytdlp = _run([YT_DLP_PATH, '--version'])
     node = _run(['node', '--version'])
     aria2c = _run([ARIA2C_PATH, '--version']) if ARIA2C_PATH else None
+    ffmpeg = _run([FFMPEG_PATH, '-version']) if FFMPEG_PATH else None
 
     # Self-heal attempt before reporting status
     pot_provider.ensure_running()
@@ -367,6 +401,7 @@ def health_check():
         'node': {'ok': bool(node), 'version': node or '未检测到'},
         'pot_provider': {'ok': pot_ok, 'version': pot_info or ('运行中' if pot_ok else '未运行')},
         'aria2c': {'ok': bool(aria2c), 'version': aria2c or '未检测到 (已回退到 http-chunk-size)'},
+        'ffmpeg': {'ok': bool(ffmpeg), 'version': ffmpeg or '未检测到 (合并音视频将失败)'},
     }})
 
 

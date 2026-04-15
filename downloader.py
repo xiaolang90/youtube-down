@@ -4,9 +4,42 @@ import re
 import os
 import threading
 import time
-from collections import OrderedDict
-from config import YT_DLP_PATH, DOWNLOAD_DIR, HTTP_CHUNK_SIZE, ARIA2C_PATH, ARIA2C_CONNECTIONS, load_settings
+from collections import OrderedDict, deque
+from config import YT_DLP_PATH, DOWNLOAD_DIR, ARIA2C_PATH, ARIA2C_CONNECTIONS, FFMPEG_PATH, load_settings
 from logger import get_logger
+
+# Auto-refresh PO token when in-flight speed degrades. Pot-provider's
+# integrityToken gets "aged" over time and googlevideo starts throttling
+# the session. Refresh policy: kill yt-dlp, invalidate pot caches, respawn
+# yt-dlp (which resumes via the default .part continue behavior). Constants
+# tuned against the 100M chunk size; 30 s window matches the long-session
+# throttle onset described in yt-dlp-speed-journey.md ch.4.
+SPEED_WINDOW_SEC = 30.0
+SPEED_SLOW_ABS_MIBPS = 2.0      # absolute floor — any slower triggers refresh
+SPEED_DECAY_FRAC = 0.5          # relative floor — < 0.5 * initial_avg triggers
+REFRESH_COOLDOWN_SEC = 60.0     # minimum gap between two refresh attempts
+REFRESH_MAX_PER_STAGE = 3       # hard cap on auto-refreshes per yt-dlp stage
+
+_SPEED_PARSE_RE = re.compile(r'^([\d.]+)\s*(B|KiB|MiB|GiB)/s$')
+_SPEED_UNIT_TO_MIB = {'B': 1 / 1048576.0, 'KiB': 1 / 1024.0, 'MiB': 1.0, 'GiB': 1024.0}
+
+
+def _parse_speed_mibps(speed_str):
+    """Convert a yt-dlp speed string like '5.45MiB/s' to MiB/s float.
+    Returns None if the string is unparsable (e.g. 'Unknown B/s')."""
+    if not speed_str:
+        return None
+    m = _SPEED_PARSE_RE.match(speed_str.strip())
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None
+    factor = _SPEED_UNIT_TO_MIB.get(m.group(2))
+    if factor is None:
+        return None
+    return val * factor
 
 log = get_logger()
 
@@ -413,13 +446,16 @@ def parse_progress_line(line):
     return None
 
 
-def run_download(task_id, url, format_id, on_progress, cancel_event):
+def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
+                     stage_phase, stage_phase_text, on_progress, cancel_event):
     """
-    Run yt-dlp download. Calls on_progress(data_dict) for each update.
-    cancel_event is a threading.Event that signals cancellation.
-    Returns (success: bool, result: dict).
+    Run one yt-dlp invocation for a single (non-merged) format_id.
+    Returns (ok: bool, filepath_or_None, error_str_or_None).
+
+    Progress lines are forwarded via on_progress with phase_text forced to
+    `stage_phase_text` so the UI shows what substage is running. `stage_phase`
+    is the stable phase code used for dedup.
     """
-    output_template = os.path.join(DOWNLOAD_DIR, '%(title)s [%(id)s].%(ext)s')
     cmd = [
         YT_DLP_PATH,
         '-f', format_id,
@@ -429,45 +465,22 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
         '--restrict-filenames',
         '--retries', '10',
         '--fragment-retries', '10',
+        '--socket-timeout', '30',
+        '--concurrent-fragments', '16',
+        # Google GFE rejects aria2c's TLS ClientHello regardless of backend
+        # (AppleTLS/GnuTLS/OpenSSL all fail at handshake). curl_cffi's
+        # impersonated Chrome fingerprint passes. See yt-dlp issue #9706:
+        # --impersonate only applies to yt-dlp's own requests, NOT to
+        # external downloaders like aria2c — so we must also avoid
+        # --downloader aria2c for any googlevideo stream.
+        '--impersonate', 'chrome',
         '--js-runtimes', 'node',
         '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
         '-o', output_template,
     ]
-    audio_only = is_audio_only_format(format_id)
-    if audio_only:
-        # Audio-only: SKIP aria2c, bare yt-dlp single TCP connection.
-        # googlevideo enforces a hard per-connection playback-rate throttle on
-        # audio the instant it sees ≥2 parallel TCPs (~40 KiB/s per connection).
-        # bench_audio_parallelism.py measured x=1 → 4140 KiB/s vs x=2 → 82 KiB/s.
-        # Single connection + fresh PO is the only path to multi-MiB/s audio.
-        log.info(f"[{task_id}] audio-only format detected ({format_id}) — "
-                 f"skipping aria2c, using bare yt-dlp")
-    elif ARIA2C_PATH:
-        # Video (or merged): aria2c 16x with medium split (10 MB pieces).
-        # Piece count = min(-s, file_size / (2 * -k)). For a 20 GB file with
-        # -s 2048 -k 1M: min(2048, 10240) = 2048 → piece ≈ 10 MB.
-        #
-        # This is the sweet spot balancing two opposing forces:
-        #   - TCP slow start: each new connection needs ~1-3 MB of data to
-        #     fully open its congestion window. Pieces smaller than 5 MB
-        #     spend 50%+ of their life in slow-start ramp-up.
-        #   - googlevideo long-session throttle: connections alive more than
-        #     ~30 s start getting rate-limited toward playback bitrate.
-        # 10 MB pieces at ~600 KiB/s per conn = ~17 s TCP lifetime. Long enough
-        # for TCP to reach full throughput, short enough to escape throttle.
-        #
-        # Iteration log (MEASURED):
-        #   -s 16 -k 1M           → 1.25 GB pieces, TCP lives 30 min, decays
-        #                           to 820 KiB/s. Total fail.
-        #   -s 256 -k 10M + keep-alive=false → 80 MB pieces, decays to 5.3 MiB/s.
-        #   -s 256 --lowest-speed=500K → death spiral abort→retry→abort, exit 5.
-        #   -s 2048 -k 1M         → 10 MB pieces, TCP ~17 s, STABLE 6.4-6.9 MiB/s
-        #                           for 16 min+ ✅ CURRENT BEST.
-        #   -s 8192 -k 256K       → rejected by aria2c (min-split-size floor 1M).
-        #   -s 8192 -k 1M         → 2.5 MB pieces, TCP ~4 s, DROPS to 5.2 MiB/s
-        #                           and still declining. Too small: TCP slow
-        #                           start dominates, most of each connection
-        #                           never reaches full throughput.
+    if use_aria2c and ARIA2C_PATH:
+        # Kept for future non-Google downloads. No caller currently passes
+        # use_aria2c=True because aria2c can't handshake to googlevideo.
         cmd += [
             '--downloader', ARIA2C_PATH,
             '--downloader-args',
@@ -475,140 +488,381 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
             f'--summary-interval=1 --console-log-level=warn',
         ]
     else:
-        cmd += ['--http-chunk-size', HTTP_CHUNK_SIZE]
+        # 100 MB chunks: safe because the speed-monitoring auto-refresh loop
+        # below will catch long-session throttle and respawn yt-dlp with a
+        # fresh PO token, sidestepping the "big chunks get throttled" problem
+        # we saw in yt-dlp-web ch.4-5.
+        cmd += ['--http-chunk-size', '100M']
     cmd += _cookie_args() + [url]
 
-    log.info(f"[{task_id}] spawning yt-dlp: {' '.join(cmd)}")
+    # Emit the stage phase up front so the UI switches immediately, before
+    # any progress line arrives. Kept outside the respawn loop so a
+    # mid-stage refresh doesn't erase the caller-set stage label.
+    on_progress({'phase': stage_phase, 'phase_text': stage_phase_text, 'progress': 0})
 
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1
-    )
-    log.debug(f"[{task_id}] yt-dlp pid={process.pid}")
+    # Stage-level state that must survive across respawns.
+    final_filepath = [None]
+    refresh_count = 0
+    last_refresh_at = 0.0
+    initial_avg_mibps = None  # locked after first SPEED_WINDOW_SEC of samples
 
-    final_filepath = None
-    stderr_lines = []
-    # Last phase emitted, shared by stdout loop and stderr thread so we dedupe
-    # across both streams. Mutated from two threads but only via assignment of
-    # a single slot, which is atomic in CPython.
-    last_phase = [None]
-    # Track [download] Destination: occurrences. For merged formats like
-    # vp9+mp4a, yt-dlp emits two Destination lines (first video, second audio).
-    # When we see the second one, we refresh pot-provider's PO token cache so
-    # the audio phase starts with a fresh integrityToken — after 30+ minutes
-    # of video downloading, the PO session is aged and googlevideo will throttle
-    # the audio phase to ~30 KiB/s per connection.
-    dest_seen = [0]
-    pot_refreshed_mid = [False]
+    while True:
+        log.info(f"[{task_id}] [{stage_phase}] spawning yt-dlp"
+                 f"{' (respawn #' + str(refresh_count) + ' after pot refresh)' if refresh_count else ''}"
+                 f": {' '.join(cmd)}")
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1
+        )
+        log.debug(f"[{task_id}] [{stage_phase}] yt-dlp pid={process.pid}")
 
-    def _emit_phase(line):
-        hit = classify_phase(line)
-        if not hit:
-            return
-        phase, text = hit
-        if last_phase[0] == phase:
-            return
-        last_phase[0] = phase
-        on_progress({'phase': phase, 'phase_text': text})
-        log.info(f"[{task_id}] phase -> {phase} ({text})")
+        # Per-process state: reset on each respawn.
+        stderr_lines = []
+        # Startup phase tracking: between yt-dlp spawn and the "[download]
+        # Destination:" line, yt-dlp goes through several extractor substages
+        # (Fetching PO Token → Downloading player API → Downloading manifest …).
+        # We surface those to the UI via classify_phase(). Once the real
+        # download starts, we flip in_download_stage and stop honoring
+        # classify_phase so the phase_text stays pinned to stage_phase_text.
+        in_download_stage = [False]
+        last_startup_phase = [None]
+        # Sliding window of (timestamp, MiB/s) samples for auto-refresh.
+        speed_samples = deque()
+        trigger_refresh = False
 
-    # Read stderr in a separate thread to prevent pipe buffer deadlock
-    def _read_stderr():
-        for line in iter(process.stderr.readline, ''):
-            s = line.strip()
-            if s:
-                stderr_lines.append(s)
-                log.debug(f"[{task_id}] stderr: {s}")
-                _emit_phase(s)
-        process.stderr.close()
+        def _maybe_emit_startup_phase(text_line):
+            if in_download_stage[0]:
+                return
+            result = classify_phase(text_line)
+            if result is None:
+                return
+            phase_code, phase_text = result
+            # '[download] Destination:' is handled by DEST_RE below; skip the
+            # classify_phase 'starting' rule to avoid a redundant flip.
+            if phase_code == 'starting':
+                return
+            if phase_code == last_startup_phase[0]:
+                return
+            last_startup_phase[0] = phase_code
+            on_progress({'phase': phase_code, 'phase_text': phase_text})
 
-    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-    stderr_thread.start()
+        def _read_stderr():
+            for line in iter(process.stderr.readline, ''):
+                s = line.strip()
+                if s:
+                    stderr_lines.append(s)
+                    log.debug(f"[{task_id}] [{stage_phase}] stderr: {s}")
+                    _maybe_emit_startup_phase(s)
+            process.stderr.close()
 
-    try:
-        for line in iter(process.stdout.readline, ''):
-            if cancel_event.is_set():
-                log.info(f"[{task_id}] cancel_event set, terminating yt-dlp")
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                return False, {'error': '用户取消'}
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
 
-            line = line.strip()
-            if not line:
-                continue
-            log.debug(f"[{task_id}] stdout: {line}")
-
-            progress = parse_progress_line(line)
-            if progress:
-                if progress.get('filepath'):
-                    final_filepath = progress['filepath']
-                    log.info(f"[{task_id}] final filepath detected: {final_filepath}")
-                    # MERGE_RE hit: surface as merging phase so the UI stops
-                    # pretending it's still at 99% during mux/fixup.
-                    if last_phase[0] != 'merging':
-                        last_phase[0] = 'merging'
-                        progress = {**progress, 'phase': 'merging', 'phase_text': '合并音视频'}
-                        log.info(f"[{task_id}] phase -> merging (合并音视频)")
-                on_progress(progress)
-            else:
-                _emit_phase(line)
-
-            # Check for destination line to get filename
-            m = DEST_RE.match(line)
-            if m:
-                final_filepath = m.group(1).strip()
-                log.info(f"[{task_id}] destination: {final_filepath}")
-                dest_seen[0] += 1
-                # On the 2nd Destination line (audio phase of merged format),
-                # refresh pot-provider caches so the upcoming audio PO token
-                # is minted from a fresh BotGuard integrityToken.
-                if dest_seen[0] == 2 and not pot_refreshed_mid[0]:
-                    pot_refreshed_mid[0] = True
-                    try:
-                        import pot_provider
-                        ok = pot_provider.invalidate_caches()
-                        log.info(f"[{task_id}] mid-process pot-provider "
-                                 f"invalidate_caches (audio phase) -> {ok}")
-                        on_progress({
-                            'phase': 'pot_refresh',
-                            'phase_text': '刷新 PO Token (音频阶段)'
-                        })
-                    except Exception as e:
-                        log.warning(f"[{task_id}] mid-process pot refresh failed: {e}")
-
-        process.stdout.close()
-        stderr_thread.join(timeout=10)
-        process.wait()
-        log.info(f"[{task_id}] yt-dlp exited with returncode={process.returncode}")
-
-        if process.returncode != 0:
-            stderr_text = '\n'.join(stderr_lines)
-            m = ERROR_RE.search(stderr_text)
-            error_msg = m.group(1) if m else stderr_text.strip()[:200]
-            log.error(f"[{task_id}] yt-dlp error: {error_msg}")
-            return False, {'error': error_msg or '下载失败'}
-
-    except Exception as e:
-        log.exception(f"[{task_id}] exception while reading yt-dlp output")
         try:
-            process.kill()
-        except OSError:
-            pass
-        return False, {'error': str(e)}
+            for line in iter(process.stdout.readline, ''):
+                if cancel_event.is_set():
+                    log.info(f"[{task_id}] [{stage_phase}] cancel_event set, terminating")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    return False, None, '用户取消'
 
-    # Determine final filename
-    filename = None
-    if final_filepath and os.path.exists(final_filepath):
-        filename = os.path.basename(final_filepath)
+                line = line.strip()
+                if not line:
+                    continue
+                log.debug(f"[{task_id}] [{stage_phase}] stdout: {line}")
+
+                _maybe_emit_startup_phase(line)
+
+                m = DEST_RE.match(line)
+                if m:
+                    final_filepath[0] = m.group(1).strip()
+                    log.info(f"[{task_id}] [{stage_phase}] destination: {final_filepath[0]}")
+                    in_download_stage[0] = True
+                    on_progress({'phase': stage_phase, 'phase_text': stage_phase_text, 'progress': 0})
+                    continue
+
+                progress = parse_progress_line(line)
+                if progress:
+                    if progress.get('filepath'):
+                        final_filepath[0] = progress['filepath']
+                    # Stamp this stage's phase_text on every progress update
+                    # so the UI never reverts to the stale "pot refresh" text.
+                    progress['phase'] = stage_phase
+                    progress['phase_text'] = stage_phase_text
+                    on_progress(progress)
+
+                    # Auto-refresh speed monitor: only track after real
+                    # download has started and we have a parseable speed.
+                    if in_download_stage[0] and progress.get('speed'):
+                        mibps = _parse_speed_mibps(progress['speed'])
+                        if mibps is not None:
+                            now = time.monotonic()
+                            speed_samples.append((now, mibps))
+                            # Prune samples older than the window.
+                            while speed_samples and (now - speed_samples[0][0]) > SPEED_WINDOW_SEC:
+                                speed_samples.popleft()
+
+                            current_avg = sum(s[1] for s in speed_samples) / len(speed_samples)
+                            window_span = now - speed_samples[0][0]
+
+                            # Lock the baseline once we have a full window.
+                            if initial_avg_mibps is None and window_span >= SPEED_WINDOW_SEC - 1.0:
+                                initial_avg_mibps = current_avg
+                                log.info(f"[{task_id}] [{stage_phase}] "
+                                         f"initial {SPEED_WINDOW_SEC:.0f}s avg locked: "
+                                         f"{initial_avg_mibps:.2f} MiB/s")
+
+                            # Only evaluate triggers once the baseline exists,
+                            # the cooldown has elapsed, and we still have
+                            # retries left. We require a full window of fresh
+                            # samples so a brief dip doesn't fire.
+                            if (initial_avg_mibps is not None
+                                    and window_span >= SPEED_WINDOW_SEC - 1.0
+                                    and refresh_count < REFRESH_MAX_PER_STAGE
+                                    and (now - last_refresh_at) > REFRESH_COOLDOWN_SEC):
+                                below_relative = current_avg < SPEED_DECAY_FRAC * initial_avg_mibps
+                                below_absolute = current_avg < SPEED_SLOW_ABS_MIBPS
+                                if below_relative or below_absolute:
+                                    reason = []
+                                    if below_relative:
+                                        reason.append(
+                                            f"{current_avg:.2f} < {SPEED_DECAY_FRAC:.0%} of initial "
+                                            f"{initial_avg_mibps:.2f}")
+                                    if below_absolute:
+                                        reason.append(f"{current_avg:.2f} < {SPEED_SLOW_ABS_MIBPS} MiB/s")
+                                    log.warning(
+                                        f"[{task_id}] [{stage_phase}] speed degraded "
+                                        f"({'; '.join(reason)}) → auto-refresh PO token")
+                                    trigger_refresh = True
+                                    last_refresh_at = now
+                                    break  # exit stdout loop; handled below
+
+            # Exited stdout loop. Drain stderr and reap the process.
+            process.stdout.close()
+            stderr_thread.join(timeout=10)
+
+            if trigger_refresh:
+                # Kill the current yt-dlp, refresh pot caches, loop to respawn.
+                # yt-dlp's default --continue behavior picks up the .part file.
+                try:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                except Exception:
+                    pass
+
+                try:
+                    import pot_provider
+                    ok_ref = pot_provider.invalidate_caches()
+                    log.info(f"[{task_id}] [{stage_phase}] mid-stage pot refresh -> {ok_ref}")
+                except Exception as e:
+                    log.warning(f"[{task_id}] [{stage_phase}] pot refresh failed: {e}")
+
+                refresh_count += 1
+                initial_avg_mibps = None  # rebaseline against fresh token
+                on_progress({
+                    'phase': 'pot_refresh',
+                    'phase_text': f'自动刷新 PO Token (#{refresh_count})',
+                })
+                continue  # respawn yt-dlp
+
+            process.wait()
+            log.info(f"[{task_id}] [{stage_phase}] yt-dlp exited rc={process.returncode}")
+
+            if process.returncode != 0:
+                stderr_text = '\n'.join(stderr_lines)
+                m = ERROR_RE.search(stderr_text)
+                error_msg = m.group(1) if m else stderr_text.strip()[:200]
+                log.error(f"[{task_id}] [{stage_phase}] yt-dlp error: {error_msg}")
+                return False, None, error_msg or '下载失败'
+
+            # Normal successful exit.
+            return True, final_filepath[0], None
+
+        except Exception as e:
+            log.exception(f"[{task_id}] [{stage_phase}] exception while reading yt-dlp output")
+            try:
+                process.kill()
+            except OSError:
+                pass
+            return False, None, str(e)
+
+
+def _mux_streams(task_id, video_path, audio_path, on_progress, cancel_event):
+    """
+    ffmpeg -c copy mux video + audio into one container. Returns
+    (ok, final_path, error). Picks mp4 when both inputs are mp4-family,
+    otherwise mkv (accepts vp9/av1/opus/etc.).
+    """
+    base = os.path.basename(video_path)
+    # Strip the ".video.<ext>" suffix we added at download time.
+    m = re.match(r'(.+)\.video\.[^.]+$', base)
+    stem = m.group(1) if m else os.path.splitext(base)[0]
+
+    v_ext = os.path.splitext(video_path)[1].lower()
+    a_ext = os.path.splitext(audio_path)[1].lower()
+    if v_ext == '.mp4' and a_ext in ('.m4a', '.mp4'):
+        final_ext = '.mp4'
     else:
-        # Scan downloads dir for most recently modified file
+        final_ext = '.mkv'
+    final_path = os.path.join(DOWNLOAD_DIR, stem + final_ext)
+
+    on_progress({'phase': 'merging', 'phase_text': '合并音视频', 'progress': 100})
+    cmd = [
+        FFMPEG_PATH, '-y',
+        '-i', video_path,
+        '-i', audio_path,
+        '-c', 'copy',
+        '-map', '0:v:0',
+        '-map', '1:a:0',
+        '-loglevel', 'error',
+        final_path,
+    ]
+    log.info(f"[{task_id}] [mux] ffmpeg: {' '.join(cmd)}")
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+    except FileNotFoundError:
+        return False, None, 'ffmpeg 未安装,无法合并音视频'
+
+    while proc.poll() is None:
+        if cancel_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return False, None, '用户取消'
+        time.sleep(0.2)
+
+    _, err = proc.communicate()
+    if proc.returncode != 0:
+        log.error(f"[{task_id}] [mux] ffmpeg rc={proc.returncode} err={err[:400]}")
+        return False, None, f'ffmpeg 合并失败: {err.strip()[:200] or proc.returncode}'
+
+    # Success: remove the intermediate files to save disk.
+    for p in (video_path, audio_path):
+        try:
+            os.remove(p)
+        except OSError as e:
+            log.warning(f"[{task_id}] [mux] failed to remove {p}: {e}")
+
+    log.info(f"[{task_id}] [mux] final: {final_path}")
+    return True, final_path, None
+
+
+def run_download(task_id, url, format_id, on_progress, cancel_event):
+    """
+    Run yt-dlp download. Calls on_progress(data_dict) for each update.
+    cancel_event is a threading.Event that signals cancellation.
+    Returns (success: bool, result: dict).
+
+    Merged formats (e.g. "616+140") are split into two sequential stages:
+    video with aria2c multi-connection, then audio with bare yt-dlp single
+    connection. This avoids the googlevideo audio-stream throttle/SSL-reset
+    that kicks in the instant ≥2 parallel TCPs hit an audio itag.
+    """
+    # Audio-only selection: one bare stage.
+    if is_audio_only_format(format_id):
+        log.info(f"[{task_id}] audio-only format {format_id} — single bare stage")
+        tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s [%(id)s].%(ext)s')
+        ok, path, err = _run_ytdlp_stage(
+            task_id, url, format_id, tmpl,
+            use_aria2c=False,
+            stage_phase='downloading_audio',
+            stage_phase_text='下载音频流',
+            on_progress=on_progress, cancel_event=cancel_event,
+        )
+        if not ok:
+            return False, {'error': err or '下载失败'}
+        return True, {'filename': _resolve_filename(path)}
+
+    # Non-merged video-only format: one bare yt-dlp stage with impersonate.
+    if '+' not in format_id:
+        log.info(f"[{task_id}] single-format {format_id} — one impersonate stage")
+        tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s [%(id)s].%(ext)s')
+        ok, path, err = _run_ytdlp_stage(
+            task_id, url, format_id, tmpl,
+            use_aria2c=False,
+            stage_phase='downloading_video',
+            stage_phase_text='下载视频流',
+            on_progress=on_progress, cancel_event=cancel_event,
+        )
+        if not ok:
+            return False, {'error': err or '下载失败'}
+        return True, {'filename': _resolve_filename(path)}
+
+    # Merged format: video stage → PO refresh → audio stage → mux.
+    # Both stages use yt-dlp impersonate (no aria2c — Google TLS fingerprint
+    # blocks it). Mid-stage PO refresh still matters to reset the googlevideo
+    # throttle state machine before the audio session starts.
+    video_id, audio_id = format_id.split('+', 1)
+    log.info(f"[{task_id}] merged format {format_id} → split: "
+             f"video={video_id} + audio={audio_id} (both impersonate chrome)")
+
+    video_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s [%(id)s].video.%(ext)s')
+    ok, video_path, err = _run_ytdlp_stage(
+        task_id, url, video_id, video_tmpl,
+        use_aria2c=False,
+        stage_phase='downloading_video',
+        stage_phase_text='下载视频流',
+        on_progress=on_progress, cancel_event=cancel_event,
+    )
+    if not ok:
+        return False, {'error': err or '视频下载失败'}
+    if not video_path or not os.path.exists(video_path):
+        return False, {'error': '视频流下载完成但未找到文件'}
+
+    # Refresh pot-provider's integrityToken before the audio stage. After a
+    # long video download the minter cache is aged and googlevideo will
+    # throttle the audio session to ~30 KiB/s per connection.
+    try:
+        import pot_provider
+        ok_ref = pot_provider.invalidate_caches()
+        log.info(f"[{task_id}] pot refresh between stages -> {ok_ref}")
+        on_progress({'phase': 'pot_refresh', 'phase_text': '刷新 PO Token (音频阶段)'})
+    except Exception as e:
+        log.warning(f"[{task_id}] pot refresh failed: {e}")
+
+    audio_tmpl = os.path.join(DOWNLOAD_DIR, '%(title)s [%(id)s].audio.%(ext)s')
+    ok, audio_path, err = _run_ytdlp_stage(
+        task_id, url, audio_id, audio_tmpl,
+        use_aria2c=False,
+        stage_phase='downloading_audio',
+        stage_phase_text='下载音频流',
+        on_progress=on_progress, cancel_event=cancel_event,
+    )
+    if not ok:
+        return False, {'error': err or '音频下载失败'}
+    if not audio_path or not os.path.exists(audio_path):
+        return False, {'error': '音频流下载完成但未找到文件'}
+
+    ok, final_path, err = _mux_streams(
+        task_id, video_path, audio_path, on_progress, cancel_event
+    )
+    if not ok:
+        return False, {'error': err or '合并失败'}
+
+    return True, {'filename': os.path.basename(final_path)}
+
+
+def _resolve_filename(hinted_path):
+    """Return basename from hinted_path if it exists, else most-recent file in DOWNLOAD_DIR."""
+    if hinted_path and os.path.exists(hinted_path):
+        return os.path.basename(hinted_path)
+    try:
         files = [(f, os.path.getmtime(os.path.join(DOWNLOAD_DIR, f)))
                  for f in os.listdir(DOWNLOAD_DIR)
                  if os.path.isfile(os.path.join(DOWNLOAD_DIR, f))]
-        if files:
-            filename = max(files, key=lambda x: x[1])[0]
-
-    return True, {'filename': filename}
+    except OSError:
+        return None
+    if not files:
+        return None
+    return max(files, key=lambda x: x[1])[0]

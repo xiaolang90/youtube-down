@@ -32,6 +32,9 @@ _aria2c_env = os.environ.get('ARIA2C_PATH', '').strip()
 ARIA2C_PATH = os.path.expanduser(_aria2c_env) if _aria2c_env else (shutil.which('aria2c') or '')
 ARIA2C_CONNECTIONS = int(os.environ.get('ARIA2C_CONNECTIONS', '16'))
 
+_ffmpeg_env = os.environ.get('FFMPEG_PATH', '').strip()
+FFMPEG_PATH = os.path.expanduser(_ffmpeg_env) if _ffmpeg_env else (shutil.which('ffmpeg') or 'ffmpeg')
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Settings are locked: always use Chrome browser cookies.
