@@ -10,7 +10,7 @@ from flask_cors import CORS
 
 from config import DOWNLOAD_DIR, MAX_CONCURRENT, HOST, PORT, load_settings, save_settings
 from models import init_db, create_task, update_task, get_task, list_tasks, delete_task, delete_all_tasks, mark_stale_downloads
-from downloader import fetch_metadata, run_download
+from downloader import fetch_metadata, run_download, _extract_video_id
 from logger import get_logger
 import pot_provider
 
@@ -56,13 +56,17 @@ def _download_worker(task_id, url, format_id):
     log.debug(f"[{task_id}] status -> downloading")
 
     cancel_event = None
+    refresh_event = None
     with active_lock:
         info = active_tasks.get(task_id)
         if info:
             cancel_event = info['cancel_event']
+            refresh_event = info.get('refresh_event')
 
     if not cancel_event:
         cancel_event = threading.Event()
+    if not refresh_event:
+        refresh_event = threading.Event()
 
     last_logged_pct = [-10.0]
 
@@ -84,7 +88,7 @@ def _download_worker(task_id, url, format_id):
             log.info(f"[{task_id}] progress {p:.1f}% speed={data.get('speed','-')} eta={data.get('eta','-')}")
 
     try:
-        success, result = run_download(task_id, url, format_id, on_progress, cancel_event)
+        success, result = run_download(task_id, url, format_id, on_progress, cancel_event, refresh_event)
     except Exception as e:
         log.exception(f"[{task_id}] run_download raised unexpected exception")
         update_task(task_id, status='failed', error=str(e))
@@ -166,6 +170,7 @@ def start_download():
     with active_lock:
         active_tasks[task_id] = {
             'cancel_event': threading.Event(),
+            'refresh_event': threading.Event(),
             'sse_queues': []
         }
 
@@ -233,6 +238,26 @@ def cancel_download(task_id):
     return jsonify({'code': 1, 'message': '任务不存在或无法取消'})
 
 
+@app.route('/api/download/<task_id>/refresh', methods=['POST'])
+def refresh_download(task_id):
+    """Manual PO-token refresh + yt-dlp respawn for a currently-running task.
+    Useful right after the user switched VPN exit / proxy node and wants to
+    re-negotiate a fresh googlevideo URL without waiting for the 45 s
+    watchdog to fire on its own. Sets an Event the download stage watches;
+    the actual kill + respawn happens in the downloader thread within a
+    few seconds."""
+    with active_lock:
+        info = active_tasks.get(task_id)
+        if not info:
+            return jsonify({'code': 1, 'message': '任务未在运行'})
+        evt = info.get('refresh_event')
+        if evt is None:
+            return jsonify({'code': 1, 'message': '该任务不支持手动刷新'})
+        evt.set()
+    log.info(f"[{task_id}] manual refresh requested")
+    return jsonify({'code': 0, 'message': '刷新中'})
+
+
 @app.route('/api/download/<task_id>/resume', methods=['POST'])
 def resume_download(task_id):
     """Restart a cancelled/failed download on the same task_id. yt-dlp's
@@ -255,6 +280,7 @@ def resume_download(task_id):
             return jsonify({'code': 1, 'message': '任务已在运行'})
         active_tasks[task_id] = {
             'cancel_event': threading.Event(),
+            'refresh_event': threading.Event(),
             'sse_queues': []
         }
 
@@ -266,13 +292,51 @@ def resume_download(task_id):
     return jsonify({'code': 0, 'message': '已继续', 'data': {'id': task_id}})
 
 
+def _cleanup_part_files_for_video(video_id, skip_if_active=True):
+    """Remove *.part files whose filename contains [<video_id>]. If
+    skip_if_active is True, refuse to clean when another *active*
+    (downloading/pending) task references the same video_id — its yt-dlp
+    is likely writing the .part right now.
+
+    Returns (removed_count, skipped_because_active: bool).
+    """
+    if not video_id:
+        return 0, False
+
+    if skip_if_active:
+        with active_lock:
+            for other_id in list(active_tasks.keys()):
+                other = get_task(other_id)
+                if other and _extract_video_id(other.get('url', '')) == video_id:
+                    return 0, True
+
+    tag = f'[{video_id}]'
+    removed = 0
+    try:
+        for fn in os.listdir(DOWNLOAD_DIR):
+            if not fn.endswith('.part'):
+                continue
+            if tag not in fn:
+                continue
+            fp = os.path.join(DOWNLOAD_DIR, fn)
+            try:
+                os.remove(fp)
+                removed += 1
+                log.info(f"removed stale .part: {fn}")
+            except OSError as e:
+                log.warning(f"failed to remove .part {fn}: {e}")
+    except OSError as e:
+        log.warning(f"list DOWNLOAD_DIR failed: {e}")
+    return removed, False
+
+
 @app.route('/api/download/<task_id>', methods=['DELETE'])
 def remove_download(task_id):
     task = get_task(task_id)
     if not task:
         return jsonify({'code': 1, 'message': '任务不存在'})
 
-    # Delete file if exists
+    # Delete the final merged/completed file if present.
     if task.get('filename'):
         filepath = os.path.join(DOWNLOAD_DIR, task['filename'])
         if os.path.exists(filepath):
@@ -281,29 +345,59 @@ def remove_download(task_id):
             except OSError:
                 pass
 
+    # Also clean any stale *.part intermediates from this video_id (both
+    # *.video.<ext>.part and *.audio.<ext>.part for merged formats, plus
+    # single-file *.mp4.part / *.webm.part). Skipped if another active
+    # task for the same video_id is still running.
+    video_id = _extract_video_id(task.get('url', ''))
+    removed_parts, skipped = _cleanup_part_files_for_video(video_id, skip_if_active=True)
+    if skipped:
+        log.info(f"[{task_id}] skipped .part cleanup: another active task shares video_id={video_id}")
+    elif removed_parts:
+        log.info(f"[{task_id}] cleaned {removed_parts} .part file(s) for video_id={video_id}")
+
     delete_task(task_id)
     return jsonify({'code': 0, 'message': '已删除'})
 
 
 @app.route('/api/downloads/all', methods=['DELETE'])
 def clear_all_downloads():
-    """Cancel all active tasks, delete all DB records, and remove downloaded files."""
+    """Cancel all active tasks, delete all DB records, and remove downloaded
+    files (including orphan .part intermediates)."""
     # Cancel any running tasks
     with active_lock:
         for task_id, info in list(active_tasks.items()):
             info['cancel_event'].set()
 
     filenames = delete_all_tasks()
-    removed = 0
+    removed_final = 0
     for fn in filenames:
         try:
             fp = os.path.join(DOWNLOAD_DIR, fn)
             if os.path.exists(fp):
                 os.remove(fp)
-                removed += 1
+                removed_final += 1
         except OSError:
             pass
-    log.info(f"cleared all downloads: {len(filenames)} db records, {removed} files removed")
+
+    # Everything is cancelled + purged from the DB, so any *.part left in
+    # the directory is orphaned and safe to wipe.
+    removed_parts = 0
+    try:
+        for fn in os.listdir(DOWNLOAD_DIR):
+            if not fn.endswith('.part'):
+                continue
+            fp = os.path.join(DOWNLOAD_DIR, fn)
+            try:
+                os.remove(fp)
+                removed_parts += 1
+            except OSError as e:
+                log.warning(f"failed to remove orphan .part {fn}: {e}")
+    except OSError as e:
+        log.warning(f"list DOWNLOAD_DIR failed during clear_all: {e}")
+
+    log.info(f"cleared all downloads: {len(filenames)} db records, "
+             f"{removed_final} final files, {removed_parts} .part files")
     return jsonify({'code': 0, 'message': f'已清空 {len(filenames)} 条记录'})
 
 

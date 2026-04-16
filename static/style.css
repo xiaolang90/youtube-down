@@ -9,6 +9,17 @@
 .progress-fill.failed {
     background: linear-gradient(90deg, #ef4444, #f97316);
 }
+/* Network stall: bar freezes in place, gets a warm amber tint + a soft
+   pulse so the user sees at a glance that the task isn't actually
+   progressing (distinct from the "failed" red). */
+.progress-fill.stalled {
+    background: linear-gradient(90deg, #f59e0b, #eab308);
+    animation: stalled-pulse 1.6s ease-in-out infinite;
+}
+@keyframes stalled-pulse {
+    0%, 100% { opacity: 0.55; }
+    50%      { opacity: 1.0; }
+}
 /* Indeterminate state: used during cold start (queued, preparing, POT
    check, extracting, manifest, formats) and during the merging phase,
    where yt-dlp emits no percentage. */

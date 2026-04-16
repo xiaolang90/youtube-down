@@ -18,7 +18,22 @@ SPEED_WINDOW_SEC = 30.0
 SPEED_SLOW_ABS_MIBPS = 2.0      # absolute floor — any slower triggers refresh
 SPEED_DECAY_FRAC = 0.5          # relative floor — < 0.5 * initial_avg triggers
 REFRESH_COOLDOWN_SEC = 60.0     # minimum gap between two refresh attempts
-REFRESH_MAX_PER_STAGE = 3       # hard cap on auto-refreshes per yt-dlp stage
+REFRESH_MAX_PER_STAGE = 20      # hard cap; generous so long downloads + VPN
+                                # hops don't run out early. 20 × 60 s cooldown
+                                # ≈ 20 min minimum before giving up.
+
+# Watchdog: detect stalls even when yt-dlp is emitting NO progress lines at
+# all (e.g. stuck TCP after a VPN IP switch, dead proxy node, black-hole
+# routing). If no speed-bearing progress line arrives for this many seconds
+# while we're in the download stage, treat it the same as a speed trigger:
+# kill → pot refresh → respawn (which re-extracts and gets a fresh
+# googlevideo URL matching the new client IP).
+WATCHDOG_STALL_SEC = 45.0
+WATCHDOG_CHECK_INTERVAL = 5.0
+# After this many seconds of no activity (but before the STALL_SEC kill
+# threshold), start pushing 'network_stall' UI events with a countdown so
+# the user knows why the displayed speed/ETA is frozen.
+WATCHDOG_WARN_SEC = 15.0
 
 _SPEED_PARSE_RE = re.compile(r'^([\d.]+)\s*(B|KiB|MiB|GiB)/s$')
 _SPEED_UNIT_TO_MIB = {'B': 1 / 1048576.0, 'KiB': 1 / 1024.0, 'MiB': 1.0, 'GiB': 1024.0}
@@ -108,6 +123,7 @@ ARIA2C_RE = re.compile(
     r'\[#\w+\s+[\d.]+\w+/([\d.]+\w+)\((\d+)%\).*?DL:([\d.]+\w+)(?:\s+ETA:(\S+))?\]'
 )
 DEST_RE = re.compile(r'\[download\] Destination:\s+(.+)')
+ALREADY_RE = re.compile(r'\[download\]\s+(.+?)\s+has already been downloaded')
 MERGE_RE = re.compile(r'\[Merger\]|Finalpath:\s*(.+)|has already been downloaded')
 ERROR_RE = re.compile(r'ERROR:\s*(.+)')
 
@@ -176,6 +192,12 @@ def fetch_metadata(url):
         '-v',  # needed to emit [youtube]/[info] phase lines on stderr in dump-json mode
         '--js-runtimes', 'node',
         '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+        # Deliberately do NOT pin player_client here — yt-dlp's default
+        # client set exposes the full DASH format list (137/313/251 etc.),
+        # whereas e.g. `ios` only exposes progressive mp4 up to 360p. The
+        # download path may use a different player_client for throttle
+        # avoidance; format list ≠ download client is OK as long as the
+        # chosen itag exists in both.
     ] + _cookie_args() + [url]
     t0 = time.monotonic()
     log.info(f"fetch_metadata start | video_id={video_id} | url={url}")
@@ -447,7 +469,8 @@ def parse_progress_line(line):
 
 
 def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
-                     stage_phase, stage_phase_text, on_progress, cancel_event):
+                     stage_phase, stage_phase_text, on_progress, cancel_event,
+                     refresh_event=None):
     """
     Run one yt-dlp invocation for a single (non-merged) format_id.
     Returns (ok: bool, filepath_or_None, error_str_or_None).
@@ -466,7 +489,7 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
         '--retries', '10',
         '--fragment-retries', '10',
         '--socket-timeout', '30',
-        '--concurrent-fragments', '16',
+        '--concurrent-fragments', '4',
         # Google GFE rejects aria2c's TLS ClientHello regardless of backend
         # (AppleTLS/GnuTLS/OpenSSL all fail at handshake). curl_cffi's
         # impersonated Chrome fingerprint passes. See yt-dlp issue #9706:
@@ -476,6 +499,11 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
         '--impersonate', 'chrome',
         '--js-runtimes', 'node',
         '--extractor-args', 'youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416',
+        # tv_downgraded bypasses SABR + often hits a less-throttled CDN
+        # bucket; web is the fallback with full DASH format coverage.
+        # Keep the list short — each client adds ~5-10s of serial API
+        # requests during extraction, and every respawn re-extracts.
+        '--extractor-args', 'youtube:player_client=tv_downgraded,web',
         '-o', output_template,
     ]
     if use_aria2c and ARIA2C_PATH:
@@ -528,7 +556,13 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
         last_startup_phase = [None]
         # Sliding window of (timestamp, MiB/s) samples for auto-refresh.
         speed_samples = deque()
-        trigger_refresh = False
+        # Mutable so both the stdout loop and the watchdog thread can flip it.
+        trigger_refresh = [False]
+        trigger_reason = ['']
+        # Last moment we received a speed-bearing progress line. The watchdog
+        # uses this to detect total stalls (e.g. dead TCP after VPN hop).
+        last_activity_ts = [time.monotonic()]
+        watchdog_stop = threading.Event()
 
         def _maybe_emit_startup_phase(text_line):
             if in_download_stage[0]:
@@ -555,19 +589,86 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
                     _maybe_emit_startup_phase(s)
             process.stderr.close()
 
+        def _watchdog():
+            # Event.wait(timeout) returns True when set, False on timeout.
+            # Loop while NOT set (i.e. while still running).
+            was_stalled = False
+            while not watchdog_stop.wait(WATCHDOG_CHECK_INTERVAL):
+                if cancel_event.is_set() or trigger_refresh[0]:
+                    return
+                # Manual refresh (user clicked "刷新并续下"): equivalent
+                # to a watchdog stall but without waiting for the 45 s
+                # threshold. Same kill → pot refresh → respawn path.
+                if refresh_event is not None and refresh_event.is_set():
+                    log.info(f"[{task_id}] [{stage_phase}] manual refresh → auto-refresh path")
+                    trigger_reason[0] = 'manual refresh'
+                    trigger_refresh[0] = True
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return
+                if not in_download_stage[0]:
+                    continue  # pre-download extractor phase, idle
+                stale = time.monotonic() - last_activity_ts[0]
+
+                if stale > WATCHDOG_STALL_SEC:
+                    log.warning(f"[{task_id}] [{stage_phase}] watchdog: no "
+                                f"progress for {stale:.0f}s → auto-refresh")
+                    trigger_reason[0] = f'watchdog stall {stale:.0f}s'
+                    trigger_refresh[0] = True
+                    # SIGKILL (not SIGTERM): yt-dlp may be blocked on a dead
+                    # socket where SIGTERM is delivered only after the read
+                    # unblocks. SIGKILL is guaranteed to tear it down so the
+                    # main stdout loop hits EOF and falls through to the
+                    # respawn handler.
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return
+
+                if stale > WATCHDOG_WARN_SEC:
+                    # Between WARN_SEC and STALL_SEC: tell the UI we're
+                    # stuck and show a countdown to the auto-refresh fire.
+                    # Pushed every check tick (5 s) so the user sees a
+                    # live-updating message instead of a frozen speed/ETA.
+                    remaining = max(0, int(WATCHDOG_STALL_SEC - stale))
+                    on_progress({
+                        'phase': 'network_stall',
+                        'phase_text': f'⏸ 网络停滞 {int(stale)}s，{remaining}s 后自动恢复',
+                    })
+                    was_stalled = True
+                elif was_stalled:
+                    # Activity resumed (main thread bumped last_activity_ts).
+                    # Re-arm so the next stall episode triggers a fresh warn.
+                    was_stalled = False
+
         stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
         stderr_thread.start()
+        watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+        watchdog_thread.start()
 
         try:
             for line in iter(process.stdout.readline, ''):
                 if cancel_event.is_set():
                     log.info(f"[{task_id}] [{stage_phase}] cancel_event set, terminating")
+                    watchdog_stop.set()
                     process.terminate()
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
                     return False, None, '用户取消'
+
+                # Manual refresh: user clicked "刷新并续下" — break out of
+                # the stdout loop immediately (can't wait for watchdog's
+                # 5 s tick when a line is arriving right now).
+                if refresh_event is not None and refresh_event.is_set() and not trigger_refresh[0]:
+                    log.info(f"[{task_id}] [{stage_phase}] manual refresh → breaking stdout loop")
+                    trigger_reason[0] = 'manual refresh'
+                    trigger_refresh[0] = True
+                    break
 
                 line = line.strip()
                 if not line:
@@ -581,7 +682,19 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
                     final_filepath[0] = m.group(1).strip()
                     log.info(f"[{task_id}] [{stage_phase}] destination: {final_filepath[0]}")
                     in_download_stage[0] = True
+                    # Reset watchdog baseline now that the download is
+                    # actually starting — the extractor phase is often
+                    # slower than 45 s and would otherwise false-fire.
+                    last_activity_ts[0] = time.monotonic()
                     on_progress({'phase': stage_phase, 'phase_text': stage_phase_text, 'progress': 0})
+                    continue
+
+                # yt-dlp skips download when file already exists:
+                # "[download] <path> has already been downloaded"
+                m_already = ALREADY_RE.match(line)
+                if m_already:
+                    final_filepath[0] = m_already.group(1).strip()
+                    log.info(f"[{task_id}] [{stage_phase}] already downloaded: {final_filepath[0]}")
                     continue
 
                 progress = parse_progress_line(line)
@@ -594,57 +707,65 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
                     progress['phase_text'] = stage_phase_text
                     on_progress(progress)
 
-                    # Auto-refresh speed monitor: only track after real
-                    # download has started and we have a parseable speed.
+                    # Feed the watchdog heartbeat whenever yt-dlp emits a
+                    # speed-bearing progress line. The speed-based auto-refresh
+                    # trigger below is currently disabled — under persistent
+                    # Google throttling it fires constantly without actually
+                    # improving throughput (pot refresh re-rolls a random
+                    # throttle bucket). Recovery still flows through the
+                    # watchdog stall path, exit-code fallback, and the manual
+                    # "🔄 刷新重试" button. Flip `if False` to re-enable.
                     if in_download_stage[0] and progress.get('speed'):
                         mibps = _parse_speed_mibps(progress['speed'])
                         if mibps is not None:
-                            now = time.monotonic()
-                            speed_samples.append((now, mibps))
-                            # Prune samples older than the window.
-                            while speed_samples and (now - speed_samples[0][0]) > SPEED_WINDOW_SEC:
-                                speed_samples.popleft()
+                            last_activity_ts[0] = time.monotonic()
 
-                            current_avg = sum(s[1] for s in speed_samples) / len(speed_samples)
-                            window_span = now - speed_samples[0][0]
+                    if False:  # speed-monitor trigger disabled — see note above
+                        if in_download_stage[0] and progress.get('speed'):
+                            mibps = _parse_speed_mibps(progress['speed'])
+                            if mibps is not None:
+                                now = time.monotonic()
+                                speed_samples.append((now, mibps))
+                                while speed_samples and (now - speed_samples[0][0]) > SPEED_WINDOW_SEC:
+                                    speed_samples.popleft()
 
-                            # Lock the baseline once we have a full window.
-                            if initial_avg_mibps is None and window_span >= SPEED_WINDOW_SEC - 1.0:
-                                initial_avg_mibps = current_avg
-                                log.info(f"[{task_id}] [{stage_phase}] "
-                                         f"initial {SPEED_WINDOW_SEC:.0f}s avg locked: "
-                                         f"{initial_avg_mibps:.2f} MiB/s")
+                                current_avg = sum(s[1] for s in speed_samples) / len(speed_samples)
+                                window_span = now - speed_samples[0][0]
 
-                            # Only evaluate triggers once the baseline exists,
-                            # the cooldown has elapsed, and we still have
-                            # retries left. We require a full window of fresh
-                            # samples so a brief dip doesn't fire.
-                            if (initial_avg_mibps is not None
-                                    and window_span >= SPEED_WINDOW_SEC - 1.0
-                                    and refresh_count < REFRESH_MAX_PER_STAGE
-                                    and (now - last_refresh_at) > REFRESH_COOLDOWN_SEC):
-                                below_relative = current_avg < SPEED_DECAY_FRAC * initial_avg_mibps
-                                below_absolute = current_avg < SPEED_SLOW_ABS_MIBPS
-                                if below_relative or below_absolute:
-                                    reason = []
-                                    if below_relative:
-                                        reason.append(
-                                            f"{current_avg:.2f} < {SPEED_DECAY_FRAC:.0%} of initial "
-                                            f"{initial_avg_mibps:.2f}")
-                                    if below_absolute:
-                                        reason.append(f"{current_avg:.2f} < {SPEED_SLOW_ABS_MIBPS} MiB/s")
-                                    log.warning(
-                                        f"[{task_id}] [{stage_phase}] speed degraded "
-                                        f"({'; '.join(reason)}) → auto-refresh PO token")
-                                    trigger_refresh = True
-                                    last_refresh_at = now
-                                    break  # exit stdout loop; handled below
+                                if initial_avg_mibps is None and window_span >= SPEED_WINDOW_SEC - 1.0:
+                                    initial_avg_mibps = current_avg
+                                    log.info(f"[{task_id}] [{stage_phase}] "
+                                             f"initial {SPEED_WINDOW_SEC:.0f}s avg locked: "
+                                             f"{initial_avg_mibps:.2f} MiB/s")
 
-            # Exited stdout loop. Drain stderr and reap the process.
+                                if (initial_avg_mibps is not None
+                                        and window_span >= SPEED_WINDOW_SEC - 1.0
+                                        and refresh_count < REFRESH_MAX_PER_STAGE
+                                        and (now - last_refresh_at) > REFRESH_COOLDOWN_SEC):
+                                    below_relative = current_avg < SPEED_DECAY_FRAC * initial_avg_mibps
+                                    below_absolute = current_avg < SPEED_SLOW_ABS_MIBPS
+                                    if below_relative or below_absolute:
+                                        reason = []
+                                        if below_relative:
+                                            reason.append(
+                                                f"{current_avg:.2f} < {SPEED_DECAY_FRAC:.0%} of initial "
+                                                f"{initial_avg_mibps:.2f}")
+                                        if below_absolute:
+                                            reason.append(f"{current_avg:.2f} < {SPEED_SLOW_ABS_MIBPS} MiB/s")
+                                        log.warning(
+                                            f"[{task_id}] [{stage_phase}] speed degraded "
+                                            f"({'; '.join(reason)}) → auto-refresh PO token")
+                                        trigger_reason[0] = f"speed slow: {'; '.join(reason)}"
+                                        trigger_refresh[0] = True
+                                        last_refresh_at = now
+                                        break  # exit stdout loop; handled below
+
+            # Exited stdout loop. Stop watchdog, drain stderr, reap process.
+            watchdog_stop.set()
             process.stdout.close()
             stderr_thread.join(timeout=10)
 
-            if trigger_refresh:
+            if trigger_refresh[0]:
                 # Kill the current yt-dlp, refresh pot caches, loop to respawn.
                 # yt-dlp's default --continue behavior picks up the .part file.
                 try:
@@ -657,18 +778,36 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
                 except Exception:
                     pass
 
+                # Make sure the old watchdog thread is fully done BEFORE
+                # the next iteration rebinds its closure variables. Without
+                # this, the old thread could sneak in one more wakeup after
+                # new state is assigned and mistakenly touch the new process.
+                watchdog_thread.join(timeout=WATCHDOG_CHECK_INTERVAL + 1)
+
                 try:
                     import pot_provider
                     ok_ref = pot_provider.invalidate_caches()
-                    log.info(f"[{task_id}] [{stage_phase}] mid-stage pot refresh -> {ok_ref}")
+                    log.info(f"[{task_id}] [{stage_phase}] mid-stage pot refresh -> {ok_ref} "
+                             f"(reason: {trigger_reason[0]})")
                 except Exception as e:
                     log.warning(f"[{task_id}] [{stage_phase}] pot refresh failed: {e}")
 
-                refresh_count += 1
+                is_manual = trigger_reason[0] == 'manual refresh'
+                # Manual refreshes are user-directed and don't burn the
+                # auto-refresh budget; consume the event so the next
+                # iteration doesn't immediately re-trigger.
+                if is_manual and refresh_event is not None:
+                    refresh_event.clear()
+                    phase_text_out = '手动刷新 PO Token，恢复中…'
+                else:
+                    refresh_count += 1
+                    phase_text_out = f'自动刷新 PO Token (#{refresh_count})'
+
+                last_refresh_at = time.monotonic()
                 initial_avg_mibps = None  # rebaseline against fresh token
                 on_progress({
                     'phase': 'pot_refresh',
-                    'phase_text': f'自动刷新 PO Token (#{refresh_count})',
+                    'phase_text': phase_text_out,
                 })
                 continue  # respawn yt-dlp
 
@@ -679,6 +818,39 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
                 stderr_text = '\n'.join(stderr_lines)
                 m = ERROR_RE.search(stderr_text)
                 error_msg = m.group(1) if m else stderr_text.strip()[:200]
+
+                # Exit-code fallback: treat non-zero exit as recoverable and
+                # retry the same task_id with pot refresh + respawn. This
+                # catches 403 from stale googlevideo URLs (common after a
+                # VPN IP switch), transient 5xx, connection resets, etc.
+                # The worker still gives up eventually once refresh_count
+                # hits REFRESH_MAX_PER_STAGE.
+                if refresh_count < REFRESH_MAX_PER_STAGE and not cancel_event.is_set():
+                    log.warning(
+                        f"[{task_id}] [{stage_phase}] yt-dlp failed "
+                        f"rc={process.returncode}, auto-retry after pot refresh "
+                        f"(error: {error_msg[:120]})")
+                    # Old watchdog may still be sleeping on its wait(); force
+                    # it to exit before rebinding closure state next iteration.
+                    watchdog_thread.join(timeout=WATCHDOG_CHECK_INTERVAL + 1)
+                    try:
+                        import pot_provider
+                        ok_ref = pot_provider.invalidate_caches()
+                        log.info(f"[{task_id}] [{stage_phase}] post-failure pot refresh -> {ok_ref}")
+                    except Exception as e:
+                        log.warning(f"[{task_id}] [{stage_phase}] pot refresh failed: {e}")
+                    refresh_count += 1
+                    last_refresh_at = time.monotonic()
+                    initial_avg_mibps = None
+                    on_progress({
+                        'phase': 'pot_refresh',
+                        'phase_text': f'失败后恢复 (#{refresh_count})',
+                    })
+                    # Small backoff so we don't hammer if the error is truly
+                    # permanent; the cap + cooldown makes this self-limiting.
+                    time.sleep(2)
+                    continue  # respawn yt-dlp
+
                 log.error(f"[{task_id}] [{stage_phase}] yt-dlp error: {error_msg}")
                 return False, None, error_msg or '下载失败'
 
@@ -686,6 +858,7 @@ def _run_ytdlp_stage(task_id, url, format_id, output_template, use_aria2c,
             return True, final_filepath[0], None
 
         except Exception as e:
+            watchdog_stop.set()
             log.exception(f"[{task_id}] [{stage_phase}] exception while reading yt-dlp output")
             try:
                 process.kill()
@@ -758,10 +931,13 @@ def _mux_streams(task_id, video_path, audio_path, on_progress, cancel_event):
     return True, final_path, None
 
 
-def run_download(task_id, url, format_id, on_progress, cancel_event):
+def run_download(task_id, url, format_id, on_progress, cancel_event, refresh_event=None):
     """
     Run yt-dlp download. Calls on_progress(data_dict) for each update.
     cancel_event is a threading.Event that signals cancellation.
+    refresh_event, if provided, is a threading.Event the user can set via
+    the /api/download/<id>/refresh endpoint to force an immediate pot
+    refresh + yt-dlp respawn (useful right after a manual VPN switch).
     Returns (success: bool, result: dict).
 
     Merged formats (e.g. "616+140") are split into two sequential stages:
@@ -779,6 +955,7 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
             stage_phase='downloading_audio',
             stage_phase_text='下载音频流',
             on_progress=on_progress, cancel_event=cancel_event,
+            refresh_event=refresh_event,
         )
         if not ok:
             return False, {'error': err or '下载失败'}
@@ -794,6 +971,7 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
             stage_phase='downloading_video',
             stage_phase_text='下载视频流',
             on_progress=on_progress, cancel_event=cancel_event,
+            refresh_event=refresh_event,
         )
         if not ok:
             return False, {'error': err or '下载失败'}
@@ -814,6 +992,7 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
         stage_phase='downloading_video',
         stage_phase_text='下载视频流',
         on_progress=on_progress, cancel_event=cancel_event,
+        refresh_event=refresh_event,
     )
     if not ok:
         return False, {'error': err or '视频下载失败'}
@@ -838,6 +1017,7 @@ def run_download(task_id, url, format_id, on_progress, cancel_event):
         stage_phase='downloading_audio',
         stage_phase_text='下载音频流',
         on_progress=on_progress, cancel_event=cancel_event,
+        refresh_event=refresh_event,
     )
     if not ok:
         return False, {'error': err or '音频下载失败'}

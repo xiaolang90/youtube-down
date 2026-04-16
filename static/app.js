@@ -8,6 +8,7 @@ let taskQueuedAt = {};    // taskId -> ms timestamp when task was enqueued
 let taskElapsedTimers = {}; // taskId -> setInterval handle for "已等待 Xs"
 let taskHasProgress = {}; // taskId -> bool, true once a real %-progress event arrived
 let taskPhaseText = {};   // taskId -> last known phase_text (for reconnects / display)
+let taskRecoveryTimers = {}; // taskId -> setTimeout handle for the recovery-hint auto-hide
 
 const PHASE_TEXT_FALLBACK = {
     queued: '排队中',
@@ -32,6 +33,35 @@ function clearElapsedTimer(taskId) {
         clearInterval(taskElapsedTimers[taskId]);
         delete taskElapsedTimers[taskId];
     }
+}
+
+// Mid-download recovery hint ("🔄 正在自动恢复 · 建议再等 30 秒"). Shown
+// when a mid-flight respawn is in progress so the user doesn't cancel
+// prematurely; auto-hidden the moment real speed resumes, or after 60 s
+// as a hard safety net.
+const RECOVERY_HINT_TTL_MS = 60000;
+function showRecoveryHint(taskId) {
+    const item = document.getElementById('queue-' + taskId);
+    if (!item) return;
+    const hintEl = item.querySelector('.queue-recovery-hint');
+    if (!hintEl) return;
+    hintEl.classList.remove('hidden');
+    if (taskRecoveryTimers[taskId]) {
+        clearTimeout(taskRecoveryTimers[taskId]);
+    }
+    taskRecoveryTimers[taskId] = setTimeout(() => {
+        hideRecoveryHint(taskId);
+    }, RECOVERY_HINT_TTL_MS);
+}
+function hideRecoveryHint(taskId) {
+    if (taskRecoveryTimers[taskId]) {
+        clearTimeout(taskRecoveryTimers[taskId]);
+        delete taskRecoveryTimers[taskId];
+    }
+    const item = document.getElementById('queue-' + taskId);
+    if (!item) return;
+    const hintEl = item.querySelector('.queue-recovery-hint');
+    if (hintEl) hintEl.classList.add('hidden');
 }
 let historyPage = 1;
 
@@ -194,6 +224,7 @@ function addQueueItem(taskId, title, formatNote, filesize) {
             <div class="flex items-center gap-2 flex-shrink-0">
                 <button class="queue-reveal hidden text-xs text-gray-400 hover:text-blue-400 transition" title="打开所在目录" onclick="revealFile('${taskId}')">📂 打开位置</button>
                 <span class="queue-status text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400">等待中</span>
+                <button class="queue-refresh hidden text-xs text-amber-400 hover:text-amber-300 transition" title="刷新 PO Token 并续传" onclick="refreshTask('${taskId}')">🔄 刷新重试</button>
                 <button class="queue-cancel text-xs text-gray-500 hover:text-red-400 transition" onclick="cancelTask('${taskId}')">取消</button>
                 <button class="queue-resume hidden text-xs text-blue-400 hover:text-blue-300 transition" onclick="resumeTask('${taskId}')">继续下载</button>
                 <button class="queue-delete hidden text-xs text-gray-500 hover:text-red-400 transition" onclick="deleteQueueTask('${taskId}')">删除</button>
@@ -205,6 +236,9 @@ function addQueueItem(taskId, title, formatNote, filesize) {
         <div class="flex justify-between text-xs text-gray-500">
             <span class="queue-percent">排队中</span>
             <span class="queue-detail">已等待 0s</span>
+        </div>
+        <div class="queue-recovery-hint hidden mt-1 text-xs text-amber-400/80">
+            🔄 正在自动恢复 · 建议再等 30 秒
         </div>
         <div class="queue-actions mt-2 hidden">
             <a class="queue-download-link text-xs text-blue-400 hover:text-blue-300" href="#" target="_blank">💾 保存到本地</a>
@@ -236,8 +270,14 @@ function updateQueueItem(taskId, data) {
     const actionsEl = item.querySelector('.queue-actions');
     const linkEl = item.querySelector('.queue-download-link');
 
-    // Phase update (cold-start or merging). Keep the bar indeterminate until
-    // we see a real %-progress line with a non-zero value and speed.
+    // Phase update.
+    //   Cold start / merging: show the phase text in the percent slot and
+    //   keep the progress bar indeterminate until real %-progress arrives.
+    //   Mid-download transitional phases (pot_refresh, re-extracting during
+    //   a respawn cycle after VPN switch / speed stall / exit-code fallback):
+    //   show the phase text in the bottom detail slot so the user can see
+    //   that something is happening, instead of a frozen-looking speed/ETA
+    //   line. The next real progress event clears it automatically.
     if (data.phase) {
         const text = data.phase_text || PHASE_TEXT_FALLBACK[data.phase] || data.phase;
         taskPhaseText[taskId] = text;
@@ -245,7 +285,34 @@ function updateQueueItem(taskId, data) {
             progressEl.classList.add('indeterminate');
             progressEl.style.width = '100%';
             percentEl.textContent = text;
+        } else if (data.phase !== 'downloading_video' && data.phase !== 'downloading_audio'
+                   && data.phase !== 'network_stall') {
+            // network_stall has its own dedicated branch below (it also
+            // tags the progress bar with .stalled). Everything else just
+            // updates the detail line.
+            detailEl.textContent = text;
         }
+
+        // Mid-download respawn cycle (pot_refresh while we've already
+        // seen real progress at least once) → show the recovery hint so
+        // the user doesn't cancel prematurely. The initial pot_refresh
+        // at task start happens before taskHasProgress is set, so it
+        // won't trigger the hint — exactly what we want.
+        if (data.phase === 'pot_refresh' && taskHasProgress[taskId]) {
+            showRecoveryHint(taskId);
+        }
+    }
+
+    // Network stall: mid-download the watchdog noticed no speed-bearing
+    // progress lines for >15s. Replace the frozen speed/ETA line with a
+    // countdown until auto-refresh fires, and tag the progress bar so it
+    // looks visually "paused". The next real progress event clears both.
+    if (data.phase === 'network_stall') {
+        detailEl.textContent = data.phase_text;
+        progressEl.classList.add('stalled');
+        // Don't fall through to the hasRealProgress branches — there's
+        // no speed/progress on a stall event and we want the bar frozen.
+        return;
     }
 
     const hasRealProgress = data.progress !== undefined
@@ -276,6 +343,10 @@ function updateQueueItem(taskId, data) {
         // clobber the speed display every second.
         taskHasProgress[taskId] = true;
         clearElapsedTimer(taskId);
+        // Real speed means any previous network-stall state is over and
+        // any in-flight recovery has completed — hide both indicators.
+        progressEl.classList.remove('stalled');
+        hideRecoveryHint(taskId);
         const parts = [];
         if (data.speed) parts.push(data.speed);
         if (data.eta) parts.push('ETA ' + data.eta);
@@ -294,6 +365,17 @@ function updateQueueItem(taskId, data) {
         statusEl.className = 'queue-status text-xs px-2 py-0.5 rounded-full ' + s.cls;
         statusEl.textContent = s.text;
 
+        // Manual-refresh button: only meaningful while yt-dlp is actually
+        // running. Visible on 'downloading', hidden on every other state.
+        const refreshEl = item.querySelector('.queue-refresh');
+        if (refreshEl) {
+            if (data.status === 'downloading') {
+                refreshEl.classList.remove('hidden');
+            } else {
+                refreshEl.classList.add('hidden');
+            }
+        }
+
         // Record start time on first downloading event
         if (data.status === 'downloading' && !taskStartTimes[taskId]) {
             taskStartTimes[taskId] = Date.now();
@@ -304,6 +386,7 @@ function updateQueueItem(taskId, data) {
             progressEl.style.width = '100%';
             percentEl.textContent = '100%';
             clearElapsedTimer(taskId);
+            hideRecoveryHint(taskId);
             progressEl.classList.add('completed');
             cancelEl.classList.add('hidden');
             const revealEl = item.querySelector('.queue-reveal');
@@ -326,6 +409,7 @@ function updateQueueItem(taskId, data) {
         } else if (data.status === 'failed') {
             progressEl.classList.remove('indeterminate');
             clearElapsedTimer(taskId);
+            hideRecoveryHint(taskId);
             progressEl.classList.add('failed');
             cancelEl.classList.add('hidden');
             const deleteEl = item.querySelector('.queue-delete');
@@ -336,6 +420,7 @@ function updateQueueItem(taskId, data) {
         } else if (data.status === 'cancelled') {
             progressEl.classList.remove('indeterminate');
             clearElapsedTimer(taskId);
+            hideRecoveryHint(taskId);
             cancelEl.classList.add('hidden');
             const deleteEl = item.querySelector('.queue-delete');
             const resumeEl = item.querySelector('.queue-resume');
@@ -346,7 +431,14 @@ function updateQueueItem(taskId, data) {
 }
 
 function updateQueueCount() {
-    const count = document.querySelectorAll('[id^="queue-"]').length - 1; // minus empty msg
+    // Only count real task cards — direct children of #queue-list that
+    // aren't the #queue-empty placeholder. The old `id^="queue-"` global
+    // selector also caught #queue-section / #queue-count / #queue-list
+    // themselves, which gave "3 个任务" on an empty queue.
+    const list = document.getElementById('queue-list');
+    const count = list
+        ? Array.from(list.children).filter(el => el.id !== 'queue-empty').length
+        : 0;
     document.getElementById('queue-count').textContent = count > 0 ? count + ' 个任务' : '';
 }
 
@@ -405,6 +497,8 @@ async function deleteQueueTask(taskId) {
             sseConnections[taskId].close();
             delete sseConnections[taskId];
         }
+        hideRecoveryHint(taskId);
+        clearElapsedTimer(taskId);
         const item = document.getElementById('queue-' + taskId);
         if (item) item.remove();
         updateQueueCount();
@@ -436,6 +530,26 @@ async function cancelTask(taskId) {
         updateQueueItem(taskId, { status: 'cancelled', progress: 0 });
     } catch (e) {
         showToast('取消失败', 'error');
+    }
+}
+
+// ── Manual PO-token refresh (for a currently-running task) ──
+// Useful right after the user switched VPN node: the current yt-dlp is
+// bound to a googlevideo URL signed for the OLD exit IP, so it's either
+// stalled or stuck at <100 KiB/s. Clicking this tells the server to kill
+// the current yt-dlp, POST /invalidate_caches to pot-provider, and respawn
+// — which re-extracts a fresh URL for the NEW exit IP and resumes from
+// the .part file seamlessly.
+async function refreshTask(taskId) {
+    try {
+        const data = await api('/api/download/' + taskId + '/refresh', {}, 'POST');
+        if (data.code !== 0) {
+            showToast(data.message || '刷新失败', 'error');
+            return;
+        }
+        showToast('已请求刷新，稍等片刻', 'info');
+    } catch (e) {
+        showToast('刷新失败', 'error');
     }
 }
 
